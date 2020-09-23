@@ -37,3 +37,13 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+
+# Data
+data_processed/
+data_unprocessed/
+
+# Unnecessary Folders
+files_old/
+results/
+Presentations/
+Plots/

@@ -1,0 +1,702 @@
+---
+title: "First Modelling of mClinica-Data"
+output: html_document
+---
+
+```{r}
+
+###### Aggregate Prices ######
+
+aggregatePrices_SkuCode <- function(dataTrain) {
+  
+  price_names_prefix <- c("mean", "max", "min")
+  price_names_skuCode <- paste0(price_names_prefix, "Price", "SkuCode", sep = "")
+  price_names_skuPrefix <- paste0(price_names_prefix, "Price", "SkuPrefix", sep = "")
+  
+  lagDemand_names_skuCode <- paste0("demand_lag", 1:4, "_SkuCode", sep = "")
+  lagDemand_names_skuPrefix <- paste0("demand_lag", 1:4, "_SkuPrefix", sep = "")
+  
+  lagCumDemand_names_skuCode <- paste0("cumDemand_lag", 1:4, "_SkuCode", sep = "")
+  lagCumDemand_names_skuPrefix <- paste0("cumDemand_lag", 1:4, "_SkuPrefix", sep = "")
+  
+  staticCols <- c("sku_code_prefix", 
+                  "quantity_perPackage",
+                  price_names_skuCode,
+                  price_names_skuPrefix,
+                  lagDemand_names_skuCode,
+                  lagDemand_names_skuPrefix,
+                  lagCumDemand_names_skuCode,
+                  lagCumDemand_names_skuPrefix,
+                  "pharmaciesActive_month", 
+                  "pharmaciesActive_sinceBeginning")
+  
+  dataTrain_agg <- dataTrain %>%
+    group_by(sku_code) %>%
+    group_by(Ordered_date_yearweek, add = TRUE) %>%
+    group_by(.dots = staticCols, add = TRUE) %>%
+    summarise(demand = sum(demand))
+  
+  return(as.data.frame(dataTrain_agg))
+}
+
+#---
+
+####### Training Skus seperately #############
+
+mClinicaML_split <- function(data = trainData,
+                             model,
+                             formula,
+                             n.ahead = 4) {
+  
+  maxWeek <- max(data$Ordered_date_yearweek)
+  
+  dataGroups <- data %>%
+    group_by(sku_code_prefix) %>%
+    group_split()
+  
+  registerDoParallel()
+  
+  resultsPerSku <- foreach(dataGroup = dataGroups, .packages = c("dplyr", "caret")) %dopar% {
+    
+    if("molecule" %in% colnames(dataGroup)) {
+      dataGroup <- dataGroup %>%
+        select(-molecule)
+    }
+    
+    dataTrain <- dataGroup %>%
+      filter(Ordered_date_yearweek <= maxWeek - n.ahead)
+    
+    dataTest <- setdiff(dataGroup, dataTrain)
+    
+    dataTrain_mod <- dataTrain %>%
+      select(-c(sku_code, sku_code_prefix))
+    
+    dataTest_mod <- dataTest %>%
+      select(-c(sku_code, sku_code_prefix))
+    
+    # 'Caret' bietet die Möglichkeit automatisiertes Parametertuning durchführen zu
+    # können (sofern das Modell tune-bare Parameter besitzt).
+    fitControl <- trainControl(method = "cv",
+                               number = 5)
+    
+    fit <- train(formula, 
+                 data = dataTrain_mod, 
+                 method = model, 
+                 trControl = fitControl)
+    
+    preds <- predict(fit, newdata = dataTest_mod)
+    
+    dataPred <- cbind(dataTest, preds)
+    
+    dataPred_agg <- dataPred %>%
+      group_by(sku_code, Ordered_date_yearweek) %>%
+      summarise("demand" = sum(demand), "preds" = sum(preds))
+    
+    return(list(fit = fit, 
+                preds = preds, 
+                actuals = dataTest$demand,
+                preds_agg = dataPred_agg$preds,
+                actuals_agg = dataPred_agg$demand,
+                "sku_code_prefix" = unique(dataGroup$sku_code_prefix)))
+  }
+  
+  sku_codes_prefix <- sapply(resultsPerSku, function(result) {
+    result$sku_code_prefix
+  })
+  names(resultsPerSku) <- sku_codes_prefix
+  
+  fits <- lapply(resultsPerSku, function(result) {
+    result$fit
+  })
+  names(fits) <- sku_codes_prefix
+  
+  lengths <- sapply(resultsPerSku, function(result) {
+    length(result$preds)
+  })
+  maxLength <- max(lengths)
+  
+  # Evaluating Results
+  predsMatrix <- sapply(resultsPerSku, function(result) {
+    preds <- result$preds
+    if(length(preds) < maxLength) {
+      preds <- c(preds, rep.int(NA, times = maxLength - length(preds)))
+      names(preds) <- 1:length(preds) 
+    }
+    
+    return(preds)
+  })
+  
+  actualsMatrix <- sapply(resultsPerSku, function(result) {
+    actuals <- result$actuals
+    
+    if(length(actuals) < maxLength) {
+      actuals <- c(actuals, rep.int(NA, times = maxLength - length(actuals)))
+      names(actuals) <- 1:length(actuals)
+    }
+    
+    return(actuals)
+  })
+  
+  errorsMatrix <- actualsMatrix - predsMatrix
+  
+  errorMeasures_calc <- sapply(1:ncol(errorsMatrix), function(j) {
+    preds <- predsMatrix[, j]
+    actuals <- actualsMatrix[, j]
+    errors <- errorsMatrix[, j]
+    
+    rmse <- rmse(errors)
+    mae <- mae(errors)
+    smape <- smape(actuals, 
+                   preds)
+    
+    return(c(rmse, mae, smape))
+  })
+  errorMeasures_calc <- t(errorMeasures_calc)
+  colnames(errorMeasures_calc) <- c("rmse", "mae", "smape")
+  
+  return(list("errorMeasurement" = errorMeasures_calc,
+              "preds" = predsMatrix,
+              "actuals" = actualsMatrix,
+              "errors" = errorsMatrix,
+              "fits" = fits))
+}
+
+############# Training Skus simultanously ##############
+
+mClinicaML_noSplit <- function(data = trainData,
+                               model,
+                               formula,
+                               n.ahead = 4) {
+  
+  if("molecule" %in% colnames(data)) {
+    data <- data %>%
+      select(-molecule)
+  }
+  
+  maxWeek <- max(data$Ordered_date_yearweek)
+  
+  dataTrain <- data %>%
+    filter(Ordered_date_yearweek <= maxWeek - n.ahead)
+  
+  dataTest <- setdiff(data, dataTrain)
+  
+  dataTrain_mod <- dataTrain %>%
+    select(-c(sku_code, sku_code_prefix))
+  
+  dataTest_mod <- dataTest %>%
+    select(-c(sku_code, sku_code_prefix))
+  
+  # 'Caret' bietet die Möglichkeit automatisiertes Parametertuning durchführen zu
+  # können (sofern das Modell tune-bare Parameter besitzt).
+  fitControl <- trainControl(method = "cv",
+                             number = 5)
+  
+  fit <- train(formula, 
+               data = dataTrain_mod, 
+               method = model, 
+               trControl = fitControl)
+  
+  preds <- predict(fit, newdata = dataTest_mod)
+  actuals <- dataTest$demand
+  errors <- actuals - preds
+  
+  rmse <- rmse(errors)
+  mae <- mae(errors)
+  smape <- smape(actuals, 
+                 preds)
+  
+  errorMeasurement <- c(rmse, mae, smape)
+  names(errorMeasurement) <- c("rmse", "mae", "smape") 
+  
+  dataPred <- cbind(dataTest, preds)
+  
+  dataPred_agg <- dataPred %>%
+    group_by(sku_code, Ordered_date_yearweek) %>%
+    summarise("demand" = sum(demand), "preds" = sum(preds))
+  
+  preds_agg <- dataPred_agg$preds
+  actuals_agg <- dataPred_agg$demand
+  errors_agg <- actuals_agg - preds_agg
+  
+  rmse_agg <- rmse(errors_agg)
+  mae_agg <- mae(errors_agg)
+  smape_agg <- smape(actuals_agg, 
+                     preds_agg)
+  
+  errorMeasurement_agg <- c(rmse_agg, mae_agg, smape_agg)
+  names(errorMeasurement_agg) <- c("rmse", "mae", "smape") 
+  
+  return(list("errorMeasurement" = errorMeasurement,
+              "preds" = preds,
+              "actuals" = actuals,
+              "preds_agg" = dataPred_agg$preds,
+              "actuals_agg" = dataPred_agg$demand,
+              "errorMeasurement_agg" = errorMeasurement_agg,
+              "errors" = errors,
+              "fit" = fit))
+}
+
+#---
+
+######## Over/Under Counts ########
+
+# The argument 'errors' can either be a vector or a matrix. If a matrix is provided the errors of each model
+# have to be 
+getOverUnderPercent <- function(errors) {
+  
+  if(is.null(nrow(errors))) {
+    errors <- errors[!is.na(errors)]
+    overPercent <- sum(errors < 0) / length(errors)
+    underPercent <- sum(errors > 0) / length(errors)
+    
+    return(data.frame(overPercent, underPercent))
+    
+  } else {
+    
+    overUnderPercent <- apply(errors, MARGIN = 2, function(errors_col) {
+      errors_col <- errors_col[!is.na(errors_col)]
+      overPercent <- sum(errors_col < 0) / length(errors_col)
+      underPercent <- sum(errors_col > 0) / length(errors_col)
+      return(c(overPercent, underPercent))
+    })
+    rownames(overUnderPercent) <- c("overPercent", "underPercent")
+    return(overUnderPercent)
+  }
+}
+
+#---
+
+######## Plot Preds ########
+
+plotPreds <- function(preds,
+                      actuals) {
+  
+  preds <- preds[!is.na(preds)]
+  actuals <- actuals[!is.na(actuals)]
+  
+  range_model <- round(max(preds) - min(preds), 2)
+  range_real  <- round(max(actuals) - min(actuals), 2)
+  
+  plotDataActuals <- data.frame("number" = seq_along(preds), 
+                                "demand" = actuals, 
+                                label = "actuals")
+  
+  plotDataPreds <- data.frame("number" = seq_along(actuals), 
+                              "demand" = preds, 
+                              label = "preds")
+  
+  plotData <- rbind(plotDataActuals, plotDataPreds)
+  
+  g <- ggplot(data = plotData, aes(x = number, y = demand, col = label, group = number)) +
+    geom_point() + 
+    geom_line() + 
+    labs(x = "Combination of week, sku_code and price", 
+         y = "demand", 
+         title = paste("Predicted vs. Actual Demand"),
+         subtitle = paste("range actuals vs. range predicted Values:", range_real, "vs.", range_model)) + 
+    theme_bw()
+  
+  print(g)
+}
+
+#---
+
+######## Boxplot Errors #########
+
+# errors can either be a matrix of errors, whose columns belong to one model or can be a vector of errors all
+# belonging to the same model.
+
+boxplotErrors <- function(errors,
+                          abs = FALSE) {
+  
+  if(is.null(nrow(errors))) {
+    errors <- as.data.frame(errors)
+  }
+
+  if(abs) {
+    errors <- abs(errors)
+  }
+  
+  ranges <- sapply(1:ncol(errors), function(j) {
+    errors_col <- errors[, j]
+    errors_col <- errors_col[!is.na(errors_col)]
+    min <- min(errors_col)
+    max <- max(errors_col)
+    return(c(min, max))
+  })
+  
+  minRange <- min(ranges[1, ])
+  maxRange <- max(ranges[2, ])
+  
+  errors_list <- lapply(1:ncol(errors), function(j) {
+    errors_col <- errors[, j]
+    return(errors_col[!is.na(errors_col)])
+  })
+  names(errors_list) <- colnames(errors)
+  
+  ggplot(stack(errors_list), aes(x = ind, y = values)) +
+    geom_boxplot(fill = "steelblue") + 
+    coord_cartesian(ylim=c(minRange, maxRange)) +
+    labs(x = "Model", 
+         y = "Error", 
+         title = "Distribution of errors among all fitted models") + 
+    theme_bw()
+}
+
+######## Error Measures #########
+
+mse <- function(errors) {
+  mse <- mean((errors)^2, na.rm = TRUE)
+  
+  mse <- round(mse, digits = 3)
+  return(mse)
+}
+
+rmse <- function(errors) {
+  rmse <- sqrt(mean((errors)^2, na.rm = TRUE))
+  
+  rmse <- round(rmse, digits = 3)
+  return(rmse)
+}
+
+mae <- function(errors) {
+  mae <- mean(abs(errors), na.rm = TRUE)
+  
+  mae <- round(mae, digits = 3)
+  return(mae)
+}
+
+smape <- function(actuals,
+                  preds) {
+  
+  if(any(abs(actuals[!is.na(actuals)]) + abs(preds[!is.na(preds)]) == 0)) {
+    index_zero <- which(abs(actuals) + abs(preds) == 0)
+    actuals[index_zero] <- 1
+  }
+  
+  errors <- actuals - preds
+  smape <- mean(abs(errors) / (abs(actuals) + abs(preds) / 2), na.rm = TRUE)
+  
+  smape <- round(smape, digits = 3)
+  return(smape)
+}
+
+getTopSkus <- function(transactions,
+                       rankingByPrefix = TRUE,
+                       topPercentSkus = 0.0005) {
+  
+  if(rankingByPrefix) sku_feature <- "sku_code_prefix" else sku_feature <- "sku_code"
+  
+  countPerSku <- transactions %>%
+    group_by(.dots = sku_feature) %>%
+    summarise(count = n())
+  
+  sku_codes_top <- countPerSku %>%
+    filter(count >= quantile(countPerSku$count, 1 - topPercentSkus))
+  
+  rankedSkus <- sku_codes_top[order(sku_codes_top$count, decreasing = TRUE), ]
+  rankedSkus <- c(rankedSkus[[sku_feature]])
+  
+  # If we have been working with sku_codes_prefixes we will grab all sku_codes that belong to the
+  # determined top sku_code_prefixes. 
+  if(!rankingByPrefix) {
+    return(rankedSkus) 
+    
+  } else {
+    sku_codes_available <- unique(transactions$sku_code)
+    sku_codes_prefix_available <- str_split(sku_codes_available, pattern = "ID|-", simplify = TRUE)[, 2]
+    topSkuCodes <- sku_codes_available[sku_codes_prefix_available %in% rankedSkus]
+    
+    return(topSkuCodes)
+  }
+} 
+
+
+```
+
+## Laden der benötigten Packages
+```{r, echo = TRUE, message = FALSE}
+library(tidyverse)
+library(caret)
+library(mlbench)
+library(modelr)
+library(gtools)
+library(Gmisc)
+library(smooth)
+library(doParallel)
+library(foreach)
+```
+
+# DATA 1 - Only skuCodes, one Price, no extrapolation
+1) We start of with the simplest kind of training data that is avaiable for us. We work on a weekly skuCode-level basis with only one price observation per week. 
+2) For now we only work with the top 1 percent of Skus.
+3) No extrapolation of prices took place here.
+
+## Splitting between sku_code_prefixes
+For the seperated fitting of every sku_code_prefix we work only with the top 0,5% of sku_codes to save computation time.
+```{r}
+transactions <- readRDS("transactions_clean.rds")
+dataTrain <- readRDS("training_withoutDistr_noExtrapolation.rds")
+sku_codes_top <- getTopSkus(transactions, rankingByPrefix = TRUE, topPercentSkus = 0.005)
+
+dataTrain_top <- dataTrain %>%
+  filter(sku_code %in% sku_codes_top)
+
+dataTrain_noDistr_noExtra_onePrice <- aggregatePrices_SkuCode(dataTrain_top)
+
+xgbTree_split_onePrice <- mClinicaML_split(data = dataTrain_noDistr_noExtra_onePrice, 
+                                           model = "xgbTree", 
+                                           formula = demand~., 
+                                           n.ahead = 4)
+```
+
+```{r}
+errorMeasurement <- xgbTree_split_onePrice$errorMeasurement
+summary(errorMeasurement)
+```
+
+```{r}
+overUnderPercent <- getOverUnderPercent(xgbTree_split_onePrice$errors)
+summary(overUnderPercent[1, ])
+```
+
+```{r}
+boxplotErrors(xgbTree_split_onePrice$errors)
+```
+
+```{r}
+sku_code_prefix <- "102068"
+preds_sku <- xgbTree_split_onePrice$preds[, sku_code_prefix]
+actuals_sku <- xgbTree_split_onePrice$actuals[, sku_code_prefix]
+
+plotPreds(preds = preds_sku,
+         actuals = actuals_sku)
+
+```
+
+## No splitting between sku_code_prefixes
+For the none-splitted fitting we work with the top 1% of sku_codes_prefixes.
+```{r}
+sku_codes_top <- getTopSkus(transactions, rankingByPrefix = TRUE, topPercentSkus = 0.01)
+
+dataTrain_top <- dataTrain %>%
+  filter(sku_code %in% sku_codes_top)
+
+dataTrain_noDistr_noExtra_onePrice <- aggregatePrices_SkuCode(dataTrain_top)
+
+xbgTree_noSplit_onePrice <- mClinicaML_noSplit(data = dataTrain_noDistr_noExtra_onePrice, 
+                                             model = "xgbTree", 
+                                             formula = demand~., 
+                                             n.ahead = 4)
+xgbTree_noSplit_onePrice <- xbgTree_noSplit_onePrice
+```
+
+```{r}
+xgbTree_noSplit_onePrice$errorMeasurement
+```
+
+```{r}
+overUnderPercent <- getOverUnderPercent(xgbTree_noSplit_onePrice$errors)
+overUnderPercent
+```
+
+```{r}
+boxplotErrors(xgbTree_noSplit_onePrice$errors)
+```
+
+```{r}
+preds_sku <- xgbTree_noSplit_onePrice$preds_agg
+actuals_sku <- xgbTree_noSplit_onePrice$actuals_agg
+
+plotPreds(preds = preds_sku,
+         actuals = actuals_sku)
+```
+
+# Data 2 - Only SkuCodes, no extrapolation
+
+1) We try to work with extrapolated price data now.
+2) For now we work on sku_code-level and disregard distributors
+3) Yet again we only work with the top 1% of sku_code_prefixes
+
+```{r}
+dataTrain <- readRDS("training_withoutDistr_noExtrapolation.rds")
+sku_codes_top <- getTopSkus(transactions, rankingByPrefix = TRUE, topPercentSkus = 0.01)
+
+dataTrain_noDistr_noExtra <- dataTrain %>%
+  filter(sku_code %in% sku_codes_top)
+
+xgbTree_noSplit_noDistr_noExtra <- mClinicaML_noSplit(data = dataTrain_noDistr_noExtra, 
+                                                    model = "xgbTree", 
+                                                    formula = demand~., 
+                                                    n.ahead = 4)
+```
+
+```{r}
+xgbTree_noSplit_noDistr_noExtra$errorMeasurement
+```
+
+```{r}
+overUnderPercent <- getOverUnderPercent(xgbTree_noSplit_noDistr_noExtra$errors)
+overUnderPercent
+```
+
+```{r}
+boxplotErrors(xgbTree_noSplit_noDistr_noExtra$errors)
+```
+
+```{r}
+preds_sku <- xgbTree_noSplit_noDistr_noExtra$preds_agg
+actuals_sku <- xgbTree_noSplit_noDistr_noExtra$actuals_agg
+
+plotPreds(preds = preds_sku,
+         actuals = actuals_sku)
+```
+
+# Data 3 - Only SkuCodes, extrapolation
+
+```{r}
+dataTrain <- readRDS("training_withoutDistr_extrapolated.rds")
+sku_codes_top <- getTopSkus(transactions, rankingByPrefix = TRUE, topPercentSkus = 0.01)
+
+dataTrain_noDistr_extra <- dataTrain %>%
+  filter(sku_code %in% sku_codes_top)
+
+xgbTree_noDistr_extra <- mClinicaML_noSplit(data = dataTrain_noDistr_extra, 
+                                            model = "xgbTree", 
+                                            formula = demand~.,
+                                            demandOfUnit = TRUE,
+                                            n.ahead = 4)
+```
+
+```{r}
+overUnderPercent <- getOverUnderPercent(xgbTree_noDistr_extra$res_noAgg$error)
+overUnderPercent
+```
+
+```{r}
+xgbTree_noDistr_extra$accuracy
+```
+
+```{r}
+boxplotErrors(xgbTree_noDistr_extra$res_noAgg$error)
+```
+
+```{r}
+res_aggSkuPrefix <- xgbTree_noDistr_extra$res_aggSkuPrefix
+res_hasProm <- res_aggSkuPrefix[res_aggSkuPrefix$hasPromotion, ]
+
+mae(res_hasProm$actual, res_hasProm$pred) / mean(res_hasProm$actual)
+
+summary(xgbTree_noDistr_extra$res_noAgg$actual)
+summary(xgbTree_noDistr_extra$res_noAgg$pred)
+```
+
+```{r}
+res_filtered <- res_aggSkuPrefix %>%
+  filter(sku_code_prefix == "102065")
+
+preds <- res_filtered$pred
+actuals <- res_filtered$actual
+
+plotPreds(preds = preds,
+         actuals = actuals)
+
+res_filtered <- res_aggSkuPrefix %>%
+  filter(sku_code_prefix == "102068")
+
+preds <- res_filtered$pred
+actuals <- res_filtered$actual
+
+plotPreds(preds = preds,
+         actuals = actuals)
+```
+
+
+
+
+# Data 4 - Only SkuCodes, no extrapolation
+
+```{r}
+dataTrain <- readRDS("training_withoutDistr_noExtrapolation.rds")
+sku_codes_top <- getTopSkus(transactions, rankingByPrefix = TRUE, topPercentSkus = 0.01)
+
+dataTrain_noDistr_noExtra <- dataTrain %>%
+  filter(sku_code %in% sku_codes_top)
+
+xgbTree_noDistr_noExtra <- mClinicaML_noSplit(data = dataTrain_noDistr_noExtra, 
+                                            model = "xgbTree", 
+                                            formula = demand~.,
+                                            demandOfUnit = TRUE,
+                                            n.ahead = 4)
+```
+
+```{r}
+overUnderPercent <- getOverUnderPercent(xgbTree_noDistr_noExtra$res_noAgg$error)
+overUnderPercent
+```
+
+```{r}
+xgbTree_noDistr_noExtra$accuracy
+```
+
+```{r}
+boxplotErrors(xgbTree_noDistr_noExtra$res_noAgg$error)
+```
+
+```{r}
+res_aggSkuPrefix <- xgbTree_noDistr_noExtra$res_aggSkuPrefix
+noZero_index <- res_aggSkuPrefix$actual != 0
+
+res_aggSkuPrefix
+
+mape(res_aggSkuPrefix$actual[noZero_index], res_aggSkuPrefix$pred[noZero_index])
+
+res_hasProm <- res_aggSkuPrefix[res_aggSkuPrefix$hasPromotion, ]
+
+mae(res_hasProm$actual, res_hasProm$pred) / mean(res_hasProm$actual)
+
+summary(xgbTree_noDistr_noExtra$res_noAgg$actual)
+summary(xgbTree_noDistr_noExtra$res_noAgg$pred)
+```
+
+```{r}
+res_filtered <- res_aggSkuPrefix %>%
+  filter(sku_code_prefix == "102065")
+
+preds <- res_filtered$pred
+actuals <- res_filtered$actual
+hasPromotion <- res_filtered$hasPromotion
+
+plotPreds(preds = preds,
+         actuals = actuals,
+         hasPromotion = hasPromotion)
+
+res_filtered <- res_aggSkuPrefix %>%
+  filter(sku_code_prefix == "102068")
+
+preds <- res_filtered$pred
+actuals <- res_filtered$actual
+hasPromotion <- res_filtered$hasPromotion
+
+plotPreds(preds = preds,
+         actuals = actuals,
+         hasPromotion = hasPromotion)
+
+
+res_filtered <- res_aggSkuPrefix %>%
+  filter(sku_code_prefix == "101942")
+
+preds <- res_filtered$pred
+actuals <- res_filtered$actual
+hasPromotion <- res_filtered$hasPromotion
+
+plotPreds(predData = res_aggSkuPrefix,
+          sku_code_prefix = "101942")
+
+
+
+```
+
+
+
+
